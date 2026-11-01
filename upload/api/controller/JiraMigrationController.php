@@ -20,6 +20,7 @@ final class JiraMigrationController
     {
         $this->pdo = $container->get('db.pdo');
         $this->repo = new JiraMigrationRepository($this->pdo);
+        $auth=$container->has('auth_user')?$container->get('auth_user'):[];$actor=is_array($auth)?(array)($auth['user']??[]):[];$request=$container->has('request')?$container->get('request'):null;$orgId=0;if($request&&$container->has('service.organization_context')){$resolved=$container->get('service.organization_context')->resolve($request,$actor);if(($resolved['status']??'')==='active')$orgId=(int)($resolved['organization']['id']??0);}$this->repo->setOrganizationId($orgId);
     }
 
     private function requestBody(): array
@@ -106,12 +107,10 @@ final class JiraMigrationController
             return JsonResponse::error('VALIDATION_ERROR', 'Name and site_url are required', 422);
         }
 
-        // Validate Jira URL
-        if (!preg_match('#^https://[a-zA-Z0-9._-]+\.atlassian\.net(:[0-9]+)?/?$#', $siteUrl)) {
-            return JsonResponse::error('SSRF_BLOCKED', 'Only https://*.atlassian.net URLs are allowed by default', 422);
+        $siteUrl = self::normalizeSiteUrl($siteUrl);
+        if ($siteUrl === null) {
+            return JsonResponse::error('SSRF_BLOCKED', 'Only HTTPS Atlassian Cloud tenant URLs on the default port are allowed', 422);
         }
-
-        $siteUrl = rtrim($siteUrl, '/');
 
         if ($authType === 'api_token') {
             if ($email === '' || $apiToken === '') {
@@ -179,7 +178,11 @@ final class JiraMigrationController
             $update['token_encrypted'] = EncryptionService::encrypt((string)$body['api_token']);
         }
         if (isset($body['site_url'])) {
-            $update['site_url'] = rtrim(trim((string)$body['site_url']), '/');
+            $siteUrl = self::normalizeSiteUrl((string)$body['site_url']);
+            if ($siteUrl === null) {
+                return JsonResponse::error('SSRF_BLOCKED', 'Only HTTPS Atlassian Cloud tenant URLs on the default port are allowed', 422);
+            }
+            $update['site_url'] = $siteUrl;
         }
 
         if ($update !== []) {
@@ -360,7 +363,9 @@ final class JiraMigrationController
         $crawler = new \Module\Crm\JiraMigration\Service\JiraCrawler($client, $this->repo);
         $result = $crawler->crawlProjects($job, (string)$connection['site_url'], (string)$connection['email'], $token);
 
-        $this->repo->updateJobStatus((string)$job['public_id'], 'completed');
+        if (!$this->repo->transitionJobStatus((string)$job['public_id'], ['draft'], 'completed')) {
+            return JsonResponse::error('JOB_STATE_CONFLICT', 'Job status changed during dry run', 409);
+        }
         $this->repo->updateJobProgress((string)$job['public_id'], 'dry_run_complete', 100, $result);
 
         return JsonResponse::success('JIRA_DRY_RUN_COMPLETED', 'Dry run completed', [
@@ -440,11 +445,14 @@ final class JiraMigrationController
             return JsonResponse::error('NOT_FOUND', 'Job not found', 404);
         }
 
-        if (!in_array($job['status'], ['draft', 'failed', 'paused', 'cancelled'], true)) {
-            return JsonResponse::error('INVALID_JOB_STATUS', 'Job cannot be started from status: ' . $job['status'], 409);
+        $body = $this->requestBody();
+        $expectedStatus = trim((string)($body['expected_status'] ?? ''));
+        if (!in_array($expectedStatus, ['draft', 'failed', 'paused', 'cancelled'], true)) {
+            return JsonResponse::error('JOB_STATE_CONFLICT', 'Expected current job status is required', 409);
         }
-
-        $this->repo->updateJobStatus($publicId, 'queued');
+        if (!$this->repo->transitionJobStatus($publicId, [$expectedStatus], 'queued')) {
+            return JsonResponse::error('JOB_STATE_CONFLICT', 'Job status changed; refresh and try again', 409);
+        }
         $this->repo->addJobLog($publicId, 'info', 'queued', 'Job queued for execution');
 
         return JsonResponse::success('JIRA_JOB_STARTED', 'Migration job started', [
@@ -462,10 +470,11 @@ final class JiraMigrationController
         if (!$job) {
             return JsonResponse::error('NOT_FOUND', 'Job not found', 404);
         }
-        if ($job['status'] !== 'running') {
-            return JsonResponse::error('INVALID_JOB_STATUS', 'Only running jobs can be paused', 409);
+        $body = $this->requestBody();
+        $expectedStatus = trim((string)($body['expected_status'] ?? ''));
+        if ($expectedStatus !== 'running' || !$this->repo->transitionJobStatus($publicId, [$expectedStatus], 'paused')) {
+            return JsonResponse::error('JOB_STATE_CONFLICT', 'Job is no longer running; refresh before pausing', 409);
         }
-        $this->repo->updateJobStatus($publicId, 'paused');
         $this->repo->addJobLog($publicId, 'info', 'paused', 'Job paused by user');
         return JsonResponse::success('JIRA_JOB_PAUSED', 'Job paused', ['job' => $this->repo->getJob($publicId)]);
     }
@@ -480,12 +489,18 @@ final class JiraMigrationController
         if (!$job) {
             return JsonResponse::error('NOT_FOUND', 'Job not found', 404);
         }
-        if (in_array($job['status'], ['completed', 'cancelled', 'archived'], true)) {
-            return JsonResponse::error('INVALID_JOB_STATUS', 'Job is already in final state', 409);
+        $body = $this->requestBody();
+        $expectedStatus = trim((string)($body['expected_status'] ?? ''));
+        $cancellable = ['draft', 'queued', 'running', 'paused', 'failed'];
+        if (!in_array($expectedStatus, $cancellable, true)) {
+            return JsonResponse::error('JOB_STATE_CONFLICT', 'Expected current job status is required', 409);
         }
-        $this->repo->updateJobStatus($publicId, 'cancelling');
-        $this->repo->addJobLog($publicId, 'info', 'cancelling', 'Job cancel requested');
-        return JsonResponse::success('JIRA_JOB_CANCELLING', 'Job cancel requested', ['job' => $this->repo->getJob($publicId)]);
+        $target = $expectedStatus === 'running' ? 'cancelling' : 'cancelled';
+        if (!$this->repo->transitionJobStatus($publicId, [$expectedStatus], $target)) {
+            return JsonResponse::error('JOB_STATE_CONFLICT', 'Job status changed; refresh and try again', 409);
+        }
+        $this->repo->addJobLog($publicId, 'info', $target, $target === 'cancelling' ? 'Job cancel requested' : 'Job cancelled by user');
+        return JsonResponse::success($target === 'cancelling' ? 'JIRA_JOB_CANCELLING' : 'JIRA_JOB_CANCELLED', 'Job cancellation accepted', ['job' => $this->repo->getJob($publicId)]);
     }
 
     public function retryFailed(array $params = []): JsonResponse
@@ -498,11 +513,15 @@ final class JiraMigrationController
         if (!$job) {
             return JsonResponse::error('NOT_FOUND', 'Job not found', 404);
         }
-        if (!in_array($job['status'], ['completed', 'failed', 'cancelled'], true)) {
-            return JsonResponse::error('INVALID_JOB_STATUS', 'Job cannot be retried from status: ' . $job['status'], 409);
+        $body = $this->requestBody();
+        $expectedStatus = trim((string)($body['expected_status'] ?? ''));
+        if (!in_array($expectedStatus, ['completed', 'failed', 'cancelled'], true)) {
+            return JsonResponse::error('JOB_STATE_CONFLICT', 'Expected terminal job status is required', 409);
         }
-        $count = $this->repo->resetFailedItems($publicId);
-        $this->repo->updateJobStatus($publicId, 'queued');
+        $count = $this->repo->retryFailedJob($publicId, $expectedStatus);
+        if ($count === null) {
+            return JsonResponse::error('JOB_STATE_CONFLICT', 'Job status changed; refresh before retrying', 409);
+        }
         $this->repo->addJobLog($publicId, 'info', 'retry', 'Retrying ' . $count . ' failed items');
         return JsonResponse::success('JIRA_JOB_RETRY', 'Retrying ' . $count . ' failed items', ['job' => $this->repo->getJob($publicId)]);
     }
@@ -711,4 +730,24 @@ final class JiraMigrationController
             'items' => $this->repo->listUnresolvedEntities($jobPublicId),
         ]);
     }
+
+    /** Normalize and constrain the remote Jira Cloud origin before storing or connecting. */
+    private static function normalizeSiteUrl(string $siteUrl): ?string
+    {
+        $parts = parse_url(trim($siteUrl));
+        if (!is_array($parts)
+            || strtolower((string)($parts['scheme'] ?? '')) !== 'https'
+            || isset($parts['user']) || isset($parts['pass'])
+            || isset($parts['query']) || isset($parts['fragment'])
+            || isset($parts['path']) && trim((string)$parts['path'], '/') !== ''
+            || (int)($parts['port'] ?? 443) !== 443) {
+            return null;
+        }
+        $host = strtolower((string)($parts['host'] ?? ''));
+        if (!preg_match('/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.atlassian\.net$/D', $host)) {
+            return null;
+        }
+        return 'https://' . $host;
+    }
+
 }

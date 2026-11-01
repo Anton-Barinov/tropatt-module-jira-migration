@@ -18,13 +18,15 @@
 
 ## Идемпотентность и выполнение
 
-Ключи источника сохраняются в module-owned `source_mappings`/`job_items`. Повторный импорт использует прежние mapping-и; режим `sync` обновляет доступные сущности. Job выполняется cron-worker'ом (`JiraWorkerHandler`) с lease и checkpoint; `import_issue_limit` ограничивает объём одного запуска. Rollback удаляет только сущности конкретного job.
+Ключи источника сохраняются в module-owned `source_mappings`/`job_items`. Повторный импорт использует прежние mapping-и; режим `sync` обновляет доступные сущности. Worker атомарно захватывает job токеном lease, продлевает lease перед каждой записью, отклоняет устаревший токен и повторно забирает job после истечения lease. `import_issue_limit` ограничивает объём одного запуска. Rollback удаляет только сущности конкретного job.
+
+Удаление подключения ограничено активным workspace и выполняется транзакционно. Пока есть связанные queued/running/paused jobs, операция отклоняется. После завершения jobs удаляются вместе с логами, элементами импорта, mappings, unresolved/unsupported данными и rate-limit state, поэтому недоступные orphan-записи не остаются.
 
 Токены шифруются через `APP_SECRET` (aes-256-gcm); секреты не возвращаются API и не пишутся в лог. Вложения проходят HTTPS/host/SSRF/размер проверки. Реальные credentials Jira в репозиторий, тесты и demo не добавляются.
 
 ## Миграции и тестирование
 
-Таблицы модуля создаются из `api/migration/001_create_tables.sql` (откат — `001_create_tables_rollback.sql`). Проверки: `php -l` всех PHP-файлов модуля, `node --check web/assets/js/module-jira-migration.js`, `php upload/api/scripts/module.php check crm.jira-migration`.
+Таблицы модуля создаются из `api/migration/001_create_tables.sql`; `002_workspace_scope.sql` добавляет изоляцию workspace, `003_worker_lease.sql` — атомарную lease-аренду (для каждого шага есть rollback SQL). Перед rollback `003` остановите cron-worker и дождитесь завершения уже запущенных PHP-запросов: rollback переводит оставшиеся jobs со статусом `running` в `paused`, сбрасывает lease, затем удаляет lease-колонки. После отката старый worker не подхватывает paused jobs автоматически; их можно снова поставить в очередь через интерфейс. Проверки: `php -l` всех PHP-файлов модуля, `node --check web/assets/js/module-jira-migration.js`, `php upload/api/scripts/module.php check crm.jira-migration`.
 
 ## Ограничения
 

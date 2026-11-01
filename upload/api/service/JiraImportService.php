@@ -8,7 +8,7 @@ use PDO;
 
 /**
  * Orchestrates the full Jira import pipeline.
- * Pipeline: crawl -> create_projects -> create_skeleton_tasks -> resolve_hierarchy -> import_fields -> 
+ * Pipeline: crawl -> create_projects -> create_skeleton_tasks -> resolve_hierarchy -> import_fields ->
  *           import_comments -> import_attachments -> import_worklogs -> import_relations ->
  *           import_versions_components -> import_sprints -> create_knowledge_artifacts -> reindex -> report
  */
@@ -26,9 +26,10 @@ final class JiraImportService
     public function processJob(string $jobPublicId): void
     {
         $job = $this->migrationRepo->getJob($jobPublicId);
-        if (!$job) {
-            return;
-        }
+        if (!$job || (int)($job['organization_id'] ?? 0) < 1) { return; }
+        $this->migrationRepo->setOrganizationId((int)$job['organization_id']);
+        if (!$this->migrationRepo->heartbeatJobLease($jobPublicId)) { throw new \RuntimeException('JIRA_JOB_LEASE_LOST'); }
+        if (!$this->migrationRepo->actor((int)$job['created_by_user_id'], (int)$job['organization_id'])) { $this->migrationRepo->updateJobStatus($jobPublicId, 'failed'); return; }
 
         $connection = $this->migrationRepo->getConnectionById((int)$job['connection_id']);
         if (!$connection) {
@@ -141,6 +142,7 @@ final class JiraImportService
         foreach ($projects as $project) {
             $projectId = $project['id'];
             $projectKey = $project['key'];
+            $this->assertWorkspaceOwner($job);
 
             try {
                 // Check if project already imported
@@ -151,7 +153,7 @@ final class JiraImportService
 
                 // Create CRM project via core API
                 // We're using direct PDO for MVP but ideally use core API
-                $projectPublicId = $this->createCrmProject($project);
+                $projectPublicId = $this->createCrmProject($project, $job);
 
                 if ($projectPublicId !== null) {
                     $this->migrationRepo->upsertJobItem($jobId, 'project', $projectId, [
@@ -175,26 +177,48 @@ final class JiraImportService
         }
     }
 
-    private function createCrmProject(array $project): ?string
+
+    private function assertWorkspaceOwner(array $job): void
+    {
+        $org = (int)($job['organization_id'] ?? 0);
+        $owner = (int)($job['created_by_user_id'] ?? 0);
+        if ($org < 1) {
+            throw new \RuntimeException('JIRA_WORKSPACE_MEMBERSHIP_REVOKED');
+        }
+        if (!$this->migrationRepo->heartbeatJobLease((string)($job['public_id'] ?? ''))) {
+            throw new \RuntimeException('JIRA_JOB_LEASE_LOST');
+        }
+        if (!$this->migrationRepo->actor($owner, $org)) {
+            throw new \RuntimeException('JIRA_WORKSPACE_MEMBERSHIP_REVOKED');
+        }
+    }
+
+    private function createCrmProject(array $project, array $job): ?string
     {
         try {
+            $this->assertWorkspaceOwner($job);
+            $organizationId=(int)$job['organization_id'];
+            $ownerId=(int)$job['created_by_user_id'];
             $now = gmdate('Y-m-d H:i:s');
             $publicId = 'prj_' . bin2hex(random_bytes(10));
             $key = $project['key'];
 
             // Check if prefix already exists
-            $check = $this->pdo->prepare("SELECT id FROM projects WHERE task_key_prefix = :prefix LIMIT 1");
-            $check->execute(['prefix' => $key]);
+            $check = $this->pdo->prepare("SELECT id FROM projects WHERE organization_id=:org AND task_key_prefix = :prefix LIMIT 1");
+            $check->execute(['prefix' => $key, 'org' => $organizationId]);
             if ($check->fetchColumn()) {
                 $key = substr($key, 0, 8) . bin2hex(random_bytes(2));
             }
 
             $stmt = $this->pdo->prepare("
-                INSERT INTO projects (public_id, title, description, status_code, priority_code, task_key_prefix, created_at, updated_at) 
-                VALUES (:public_id, :title, :desc, 'active', 'normal', :prefix, :created_at, :updated_at)
+                INSERT INTO projects (public_id, organization_id, title, description, status_code, priority_code, task_key_prefix, created_by_user_id, created_at, updated_at)
+                VALUES (:public_id, :org, :title, :desc, 'active', 'normal', :prefix, :owner, :created_at, :updated_at)
             ");
+$this->assertWorkspaceOwner($job);
             $stmt->execute([
                 'public_id' => $publicId,
+                'org' => $organizationId,
+                'owner' => $ownerId,
                 'title' => $project['name'],
                 'desc' => 'Imported from Jira: ' . $project['key'] . ' (' . ($project['project_type_key'] ?? 'software') . ')',
                 'prefix' => $key,
@@ -256,7 +280,7 @@ final class JiraImportService
                         }
 
                         // Create task via direct PDO (MVP approach)
-                        $taskPublicId = $this->createCrmTask($projectMapping, $issueKey, $summary, $fields);
+                        $taskPublicId = $this->createCrmTask($job, $projectMapping, $issueKey, $summary, $fields);
 
                         if ($taskPublicId !== null) {
                             $this->migrationRepo->upsertJobItem($jobId, 'issue', $issueId, [
@@ -286,7 +310,7 @@ final class JiraImportService
         }
     }
 
-    private function createCrmTask(string $projectPublicId, string $issueKey, string $summary, array $fields): ?string
+    private function createCrmTask(array $job, string $projectPublicId, string $issueKey, string $summary, array $fields): ?string
     {
         try {
             $publicId = 'tsk_' . bin2hex(random_bytes(10));
@@ -310,11 +334,14 @@ final class JiraImportService
             $dueAt = !empty($fields['duedate']) ? $fields['duedate'] : null;
 
             $stmt = $this->pdo->prepare("
-                INSERT INTO tasks (public_id, project_id, title, description, status_code, priority_code, assignee_user_id, creator_user_id, due_at, created_at, updated_at)
-                VALUES (:public_id, (SELECT id FROM projects WHERE public_id = :project_pub), :title, :description, :status_code, :priority_code, :assignee, (SELECT id FROM users ORDER BY id LIMIT 1), :due_at, :created_at, :updated_at)
+                INSERT INTO tasks (public_id, organization_id, project_id, title, description, status_code, priority_code, assignee_user_id, creator_user_id, due_at, created_at, updated_at)
+                VALUES (:public_id, :org, (SELECT id FROM projects WHERE public_id = :project_pub AND organization_id=:org), :title, :description, :status_code, :priority_code, :assignee, :creator, :due_at, :created_at, :updated_at)
             ");
+$this->assertWorkspaceOwner($job);
             $stmt->execute([
                 'public_id' => $publicId,
+                'org' => (int)$job['organization_id'],
+                'creator' => (int)$job['created_by_user_id'],
                 'project_pub' => $projectPublicId,
                 'title' => mb_substr($summary ?: $issueKey, 0, 255),
                 'description' => 'Imported from Jira: ' . $issueKey,
@@ -328,8 +355,9 @@ final class JiraImportService
 
             // Store Jira key in task description metadata
             $desc = 'Imported from Jira: ' . $issueKey;
-            $this->pdo->prepare('UPDATE tasks SET description = CONCAT(description, :meta) WHERE public_id = :pub')
-                ->execute(['meta' => "\n\n[Source: Jira {$issueKey}]", 'pub' => $publicId]);
+            $this->assertWorkspaceOwner($job);
+            $this->pdo->prepare('UPDATE tasks SET description = CONCAT(description, :meta) WHERE public_id = :pub AND organization_id=:org')
+                ->execute(['meta' => "\n\n[Source: Jira {$issueKey}]", 'pub' => $publicId, 'org' => (int)$job['organization_id']]);
 
             return $publicId;
         } catch (\Throwable $e) {
@@ -350,6 +378,7 @@ final class JiraImportService
         $issueMap = [];
 
         foreach ($allItems as $item) {
+            $this->assertWorkspaceOwner($job);
             if ($item['source_type'] === 'issue' && $item['target_public_id']) {
                 $issueMap[$item['source_id']] = $item['target_public_id'];
             }
@@ -376,12 +405,13 @@ final class JiraImportService
                 $parentPublicId = $issueMap[$sourceParentId];
                 try {
                     // Resolve parent task internal ID
-                $parentIdStmt = $this->pdo->prepare("SELECT id FROM tasks WHERE public_id = :pub LIMIT 1");
-                $parentIdStmt->execute(['pub' => $parentPublicId]);
+                $parentIdStmt = $this->pdo->prepare("SELECT id FROM tasks WHERE public_id = :pub AND organization_id=:org LIMIT 1");
+                $parentIdStmt->execute(['pub' => $parentPublicId, 'org' => (int)$job['organization_id']]);
                 $parentIdVal = (int)$parentIdStmt->fetchColumn();
                 if ($parentIdVal > 0) {
-                    $this->pdo->prepare("UPDATE tasks SET parent_task_id = :parent_id WHERE public_id = :child")
-                        ->execute(['parent_id' => $parentIdVal, 'child' => $childPublicId]);
+$this->assertWorkspaceOwner($job);
+                    $this->pdo->prepare("UPDATE tasks SET parent_task_id = :parent_id WHERE public_id = :child AND organization_id=:org")
+                        ->execute(['parent_id' => $parentIdVal, 'child' => $childPublicId, 'org' => (int)$job['organization_id']]);
                 }
                 } catch (\Throwable $e) {
                     error_log('[JiraImportService::resolveHierarchy] Parent task update failed: ' . $e->getMessage());
@@ -414,6 +444,7 @@ final class JiraImportService
         $issueItems = array_filter($pendingItems, fn($i) => $i['source_type'] === 'issue');
 
         foreach ($issueItems as $item) {
+            $this->assertWorkspaceOwner($job);
             $issueKey = $item['source_key'] ?? '';
             $targetPublicId = (string)$item['target_public_id'];
             if ($targetPublicId === '') {
@@ -444,7 +475,9 @@ final class JiraImportService
 
                 $dueAt = !empty($fields['duedate']) ? $fields['duedate'] : null;
 
-                $this->pdo->prepare("UPDATE tasks SET description = :desc, status_code = :status, priority_code = :priority, assignee_user_id = :assignee, due_at = :due_at WHERE public_id = :pub")
+$this->assertWorkspaceOwner($job);
+                $this->assertWorkspaceOwner($job);
+                $this->pdo->prepare("UPDATE tasks SET description = :desc, status_code = :status, priority_code = :priority, assignee_user_id = :assignee, due_at = :due_at WHERE public_id = :pub AND organization_id=:org")
                     ->execute([
                         'desc' => $description,
                         'status' => $statusCode,
@@ -452,12 +485,13 @@ final class JiraImportService
                         'assignee' => $assigneeUserId,
                         'due_at' => $dueAt,
                         'pub' => $targetPublicId,
+                        'org' => (int)$job['organization_id'],
                     ]);
 
                 // Import labels as tags
                 $labels = $fields['labels'] ?? [];
                 foreach ($labels as $label) {
-                    $this->ensureTag($label, $targetPublicId);
+                    $this->ensureTag($job, $label, $targetPublicId);
                 }
 
             } catch (\Throwable $e) {
@@ -477,6 +511,7 @@ final class JiraImportService
         $issueItems = $this->migrationRepo->findJobItemsByStatus($jobId, 'imported', 10000);
 
         foreach ($issueItems as $item) {
+            $this->assertWorkspaceOwner($job);
             if ($item['source_type'] !== 'issue' || !$item['target_public_id']) {
                 continue;
             }
@@ -488,6 +523,7 @@ final class JiraImportService
                 $comments = $this->client->getIssueComments($siteUrl, $email, $token, $issueKey);
 
                 foreach ($comments as $rawComment) {
+            $this->assertWorkspaceOwner($job);
                     $commentId = (string)($rawComment['id'] ?? '');
 
                     // Check if already imported
@@ -514,9 +550,12 @@ final class JiraImportService
 
                     $commentText = "**Imported from Jira ({$issueKey})**\n\n*Author: {$author}*\n\n{$bodyText}";
 
-                    $this->pdo->prepare("INSERT INTO comments (public_id, task_id, author_user_id, body, visibility, created_at, updated_at) VALUES (:pub, (SELECT id FROM tasks WHERE public_id = :task_pub), (SELECT id FROM users ORDER BY id LIMIT 1), :body, 'internal', :created_at, :updated_at)")
+$this->assertWorkspaceOwner($job);
+                    $this->pdo->prepare("INSERT INTO comments (public_id, organization_id, task_id, author_user_id, body, visibility, created_at, updated_at) VALUES (:pub, :org, (SELECT id FROM tasks WHERE public_id = :task_pub AND organization_id=:org), :owner, :body, 'internal', :created_at, :updated_at)")
                         ->execute([
                             'pub' => $commentPublicId,
+                            'org' => (int)$job['organization_id'],
+                            'owner' => (int)$job['created_by_user_id'],
                             'task_pub' => $taskPublicId,
                             'body' => $commentText,
                             'created_at' => $now,
@@ -548,6 +587,7 @@ final class JiraImportService
         $issueItems = $this->migrationRepo->findJobItemsByStatus($jobId, 'imported', 10000);
 
         foreach ($issueItems as $item) {
+            $this->assertWorkspaceOwner($job);
             if ($item['source_type'] !== 'issue' || !$item['target_public_id']) {
                 continue;
             }
@@ -560,6 +600,7 @@ final class JiraImportService
                 $attachments = $issue['fields']['attachment'] ?? [];
 
                 foreach ($attachments as $attachment) {
+            $this->assertWorkspaceOwner($job);
                     $attachmentId = (string)($attachment['id'] ?? '');
 
                     $existing = $this->migrationRepo->findJobItem($jobId, 'attachment', $attachmentId);
@@ -567,9 +608,10 @@ final class JiraImportService
                         continue;
                     }
 
-                    $filename = $attachment['filename'] ?? 'file.bin';
-                    $mimeType = $attachment['mimeType'] ?? 'application/octet-stream';
-                    $size = (int)($attachment['size'] ?? 0);
+                    $filename = basename((string)($attachment['filename'] ?? 'file.bin'));
+                    $filename = preg_replace('/[\x00-\x1F\x7F]/', '', $filename) ?: 'file.bin';
+                    $filename = mb_substr($filename, 0, 255);
+                    $declaredSize = (int)($attachment['size'] ?? 0);
                     $contentUrl = $attachment['content'] ?? '';
 
                     if ($contentUrl === '') {
@@ -578,48 +620,80 @@ final class JiraImportService
 
                     // Check size limit
                     $maxSize = 20 * 1024 * 1024;
-                    if ($size > $maxSize) {
+                    if ($declaredSize > $maxSize) {
                         $this->migrationRepo->addUnresolvedEntity($jobPublicId, 'attachment', $attachmentId,
-                            'FILE_TOO_LARGE', "Attachment {$filename} ({$size} bytes) exceeds limit"
+                            'FILE_TOO_LARGE', "Attachment {$filename} ({$declaredSize} bytes) exceeds limit"
                         );
                         continue;
                     }
 
-                    $tmpPath = sys_get_temp_dir() . '/jira_attachment_' . bin2hex(random_bytes(8)) . '_' . preg_replace('/[^a-zA-Z0-9._-]/', '_', $filename);
-
-                    $downloadResult = $this->client->downloadAttachment($siteUrl, $email, $token, $contentUrl, $tmpPath);
-                    if (!$downloadResult['success']) {
-                        $this->migrationRepo->addUnresolvedEntity($jobPublicId, 'attachment', $attachmentId,
-                            'DOWNLOAD_FAILED', $downloadResult['error'] ?? 'Unknown'
-                        );
+                    $tmpPath = tempnam(sys_get_temp_dir(), 'jira_attachment_');
+                    if ($tmpPath === false) {
+                        $this->migrationRepo->addUnresolvedEntity($jobPublicId, 'attachment', $attachmentId, 'TEMP_STORAGE_FAILED', 'Could not allocate a temporary attachment file');
                         continue;
                     }
+                    @chmod($tmpPath, 0600);
 
-                    // Read file and create file record
+                    try {
+                        $downloadResult = $this->client->downloadAttachment($siteUrl, $email, $token, $contentUrl, $tmpPath);
+                        if (!$downloadResult['success']) {
+                            $this->migrationRepo->addUnresolvedEntity($jobPublicId, 'attachment', $attachmentId,
+                                'DOWNLOAD_FAILED', $downloadResult['error'] ?? 'Unknown'
+                            );
+                            continue;
+                        }
+
+                    // Do not trust remote metadata for the stored size or MIME type.
+                    $actualSize = filesize($tmpPath);
+                    if (!is_int($actualSize) || $actualSize < 1 || $actualSize > $maxSize) {
+                        $this->migrationRepo->addUnresolvedEntity($jobPublicId, 'attachment', $attachmentId, 'FILE_TOO_LARGE', "Attachment {$filename} exceeds the verified size limit");
+                        continue;
+                    }
                     $content = file_get_contents($tmpPath);
+                    if (!is_string($content)) {
+                        $this->migrationRepo->addUnresolvedEntity($jobPublicId, 'attachment', $attachmentId, 'READ_FAILED', 'Downloaded attachment could not be read');
+                        continue;
+                    }
                     $checksum = hash('sha256', $content);
+                    $mimeType = 'application/octet-stream';
+                    if (class_exists(\finfo::class)) {
+                        $finfo = new \finfo(FILEINFO_MIME_TYPE);
+                        $detectedMime = $finfo->file($tmpPath);
+                        if (is_string($detectedMime) && $detectedMime !== '') {
+                            $mimeType = $detectedMime;
+                        }
+                    }
 
                     $filePublicId = 'fil_' . bin2hex(random_bytes(10));
                     $now = gmdate('Y-m-d H:i:s');
 
                     // Store file to disk
                     $storageDir = dirname(__DIR__, 4) . '/storage/uploads/jira-import';
-                    if (!is_dir($storageDir)) {
-                        @mkdir($storageDir, 0755, true);
+                    if (!is_dir($storageDir) && !@mkdir($storageDir, 0750, true) && !is_dir($storageDir)) {
+                        $this->migrationRepo->addUnresolvedEntity($jobPublicId, 'attachment', $attachmentId, 'STORAGE_FAILED', 'Could not create private attachment storage');
+                        continue;
                     }
-                    $storageFilename = $filePublicId . '_' . preg_replace('/[^a-zA-Z0-9._-]/', '_', $filename);
+                    $storageFilename = $filePublicId . '.bin';
                     $storagePath = 'uploads/jira-import/' . $storageFilename;
                     $fullPath = $storageDir . '/' . $storageFilename;
-                    file_put_contents($fullPath, $content);
+                    $this->assertWorkspaceOwner($job);
+                    if (file_put_contents($fullPath, $content, LOCK_EX) !== $actualSize) {
+                        @unlink($fullPath);
+                        $this->migrationRepo->addUnresolvedEntity($jobPublicId, 'attachment', $attachmentId, 'STORAGE_FAILED', 'Could not persist the complete attachment');
+                        continue;
+                    }
 
-                    $this->pdo->prepare("INSERT INTO files (public_id, entity_type, entity_public_id, uploader_user_id, original_name, storage_path, mime_type, size_bytes, created_at) VALUES (:pub, 'task', :task_pub, (SELECT id FROM users ORDER BY id LIMIT 1), :name, :storage_path, :mime, :size, :created_at)")
+$this->assertWorkspaceOwner($job);
+                    $this->pdo->prepare("INSERT INTO files (public_id, organization_id, entity_type, entity_public_id, uploader_user_id, original_name, storage_path, mime_type, size_bytes, created_at) VALUES (:pub, :org, 'task', :task_pub, :owner, :name, :storage_path, :mime, :size, :created_at)")
                         ->execute([
                             'pub' => $filePublicId,
+                            'org' => (int)$job['organization_id'],
+                            'owner' => (int)$job['created_by_user_id'],
                             'task_pub' => $taskPublicId,
                             'name' => $filename,
                             'storage_path' => $storagePath,
                             'mime' => $mimeType,
-                            'size' => $size,
+                            'size' => $actualSize,
                             'created_at' => $now,
                         ]);
 
@@ -632,6 +706,9 @@ final class JiraImportService
                         'status' => 'imported',
                         'checksum' => $checksum,
                     ]);
+                    } finally {
+                        @unlink($tmpPath);
+                    }
                 }
             } catch (\Throwable $e) {
                 error_log('[JiraImportService::importAttachments] Issue ' . $issueKey . ': ' . $e->getMessage());
@@ -650,6 +727,7 @@ final class JiraImportService
         $issueItems = $this->migrationRepo->findJobItemsByStatus($jobId, 'imported', 10000);
 
         foreach ($issueItems as $item) {
+            $this->assertWorkspaceOwner($job);
             if ($item['source_type'] !== 'issue' || !$item['target_public_id']) {
                 continue;
             }
@@ -661,6 +739,7 @@ final class JiraImportService
                 $worklogs = $this->client->getIssueWorklogs($siteUrl, $email, $token, $issueKey);
 
                 foreach ($worklogs as $wl) {
+            $this->assertWorkspaceOwner($job);
                     $wlId = (string)($wl['id'] ?? '');
 
                     $existing = $this->migrationRepo->findJobItem($jobId, 'worklog', $wlId);
@@ -683,9 +762,12 @@ final class JiraImportService
                     $wlPublicId = 'wkl_' . bin2hex(random_bytes(10));
                     $now = gmdate('Y-m-d H:i:s');
 
-                    $this->pdo->prepare("INSERT INTO work_logs (public_id, task_id, user_id, minutes_spent, note, logged_at, created_at) VALUES (:pub, (SELECT id FROM tasks WHERE public_id = :task_pub), (SELECT id FROM users ORDER BY id LIMIT 1), :minutes, :desc, :logged_at, :created_at)")
+$this->assertWorkspaceOwner($job);
+                    $this->pdo->prepare("INSERT INTO work_logs (public_id, organization_id, task_id, user_id, minutes_spent, note, logged_at, created_at) VALUES (:pub, :org, (SELECT id FROM tasks WHERE public_id = :task_pub AND organization_id=:org), :owner, :minutes, :desc, :logged_at, :created_at)")
                         ->execute([
                             'pub' => $wlPublicId,
+                            'org' => (int)$job['organization_id'],
+                            'owner' => (int)$job['created_by_user_id'],
                             'task_pub' => $taskPublicId,
                             'minutes' => (int)($timeSpentSeconds / 60),
                             'desc' => 'Imported from Jira: ' . ($commentText ?: $issueKey),
@@ -718,6 +800,7 @@ final class JiraImportService
         $taskIds = [];
         $targetByKey = [];
         foreach ($issueItems as $item) {
+            $this->assertWorkspaceOwner($job);
             if ($item['source_type'] === 'issue' && $item['target_public_id']) {
                 $targetByKey[$item['source_key']] = $item['target_public_id'];
                 $taskIds[$item['source_id']] = $item['target_public_id'];
@@ -725,6 +808,7 @@ final class JiraImportService
         }
 
         foreach ($issueItems as $item) {
+            $this->assertWorkspaceOwner($job);
             if ($item['source_type'] !== 'issue' || !$item['target_public_id']) {
                 continue;
             }
@@ -772,9 +856,12 @@ final class JiraImportService
                         try {
                             // Generate a unique active_key to avoid duplicates
                 $activeKey = 'jira_' . bin2hex(random_bytes(8));
-                $this->pdo->prepare("INSERT INTO task_relations_v2 (public_id, source_task_id, target_task_id, relation_type, note, created_by_user_id, created_at, updated_at) VALUES (:pub, (SELECT id FROM tasks WHERE public_id = :src), (SELECT id FROM tasks WHERE public_id = :tgt), :type, :note, (SELECT id FROM users ORDER BY id LIMIT 1), :created_at, :updated_at)")
+$this->assertWorkspaceOwner($job);
+                $this->pdo->prepare("INSERT INTO task_relations_v2 (public_id, organization_id, source_task_id, target_task_id, relation_type, note, created_by_user_id, created_at, updated_at) VALUES (:pub, :org, (SELECT id FROM tasks WHERE public_id = :src AND organization_id=:org), (SELECT id FROM tasks WHERE public_id = :tgt AND organization_id=:org), :type, :note, :owner, :created_at, :updated_at)")
                                 ->execute([
                                     'pub' => $relationPublicId,
+                                    'org' => (int)$job['organization_id'],
+                                    'owner' => (int)$job['created_by_user_id'],
                                     'src' => $sourceTaskId,
                                     'tgt' => $targetTaskId,
                                     'type' => $relationType,
@@ -824,6 +911,7 @@ final class JiraImportService
                 $sprints = $this->client->getBoardSprints($siteUrl, $email, $token, $boardId);
 
                 foreach ($sprints as $sprint) {
+            $this->assertWorkspaceOwner($job);
                     $sprintId = (string)$sprint['id'];
 
                     $existing = $this->migrationRepo->findJobItem($jobId, 'sprint', $sprintId);
@@ -847,9 +935,12 @@ final class JiraImportService
                         default => 'planned',
                     };
 
-                    $this->pdo->prepare("INSERT INTO work_cycles (public_id, project_id, title, goal, status, start_at, end_at, created_by_user_id, sort_order, created_at, updated_at) VALUES (:pub, (SELECT id FROM projects WHERE public_id = :project_pub), :title, :goal, :status, :start_at, :end_at, (SELECT id FROM users ORDER BY id LIMIT 1), 65535, :created_at, :updated_at)")
+$this->assertWorkspaceOwner($job);
+                    $this->pdo->prepare("INSERT INTO work_cycles (public_id, organization_id, project_id, title, goal, status, start_at, end_at, created_by_user_id, sort_order, created_at, updated_at) VALUES (:pub, :org, (SELECT id FROM projects WHERE public_id = :project_pub AND organization_id=:org), :title, :goal, :status, :start_at, :end_at, :owner, 65535, :created_at, :updated_at)")
                         ->execute([
                             'pub' => $cyclePublicId,
+                            'org' => (int)$job['organization_id'],
+                            'owner' => (int)$job['created_by_user_id'],
                             'project_pub' => $projectTargets[$firstProjectKey] ?? reset($projectTargets),
                             'title' => $sprint['name'],
                             'goal' => $sprint['goal'] ?? '',
@@ -964,32 +1055,35 @@ final class JiraImportService
         return null;
     }
 
-    private function ensureTag(string $labelName, string $taskPublicId): void
+    private function ensureTag(array $job, string $labelName, string $taskPublicId): void
     {
         try {
+            $this->assertWorkspaceOwner($job);
             // Find or create tag
-            $check = $this->pdo->prepare("SELECT id, public_id FROM tags WHERE code = :code LIMIT 1");
-            $check->execute(['code' => $labelName]);
+            $check = $this->pdo->prepare("SELECT id, public_id FROM tags WHERE code = :code AND organization_id=:org LIMIT 1");
+            $check->execute(['code' => $labelName, 'org' => (int)$job['organization_id']]);
             $tag = $check->fetch(PDO::FETCH_ASSOC);
 
             if (!$tag) {
                 $tagPublicId = 'tag_' . bin2hex(random_bytes(10));
                 $now = gmdate('Y-m-d H:i:s');
-                $this->pdo->prepare("INSERT INTO tags (public_id, code, title, color, created_at) VALUES (:pub, :code, :title, :color, :now)")
-                    ->execute(['pub' => $tagPublicId, 'code' => $labelName, 'title' => $labelName, 'color' => '#6b7280', 'now' => $now]);
+$this->assertWorkspaceOwner($job);
+                $this->pdo->prepare("INSERT INTO tags (public_id, organization_id, code, title, color, created_at) VALUES (:pub, :org, :code, :title, :color, :now)")
+                    ->execute(['pub' => $tagPublicId, 'org' => (int)$job['organization_id'], 'code' => $labelName, 'title' => $labelName, 'color' => '#6b7280', 'now' => $now]);
                 $tagId = (int)$this->pdo->lastInsertId();
             } else {
                 $tagId = (int)$tag['id'];
             }
 
             // Attach to task
-            $taskId = $this->pdo->prepare("SELECT id FROM tasks WHERE public_id = :pub LIMIT 1");
-            $taskId->execute(['pub' => $taskPublicId]);
+            $taskId = $this->pdo->prepare("SELECT id FROM tasks WHERE public_id = :pub AND organization_id=:org LIMIT 1");
+            $taskId->execute(['pub' => $taskPublicId, 'org' => (int)$job['organization_id']]);
             $taskIdVal = (int)$taskId->fetchColumn();
 
             if ($taskIdVal > 0) {
-                $this->pdo->prepare("INSERT IGNORE INTO entity_tags (entity_type, entity_public_id, tag_id) VALUES ('task', :entity_pub_id, :tag_id)")
-                    ->execute(['entity_pub_id' => $taskPublicId, 'tag_id' => $tagId]);
+$this->assertWorkspaceOwner($job);
+                $this->pdo->prepare("INSERT INTO entity_tags (organization_id, entity_type, entity_public_id, tag_id) SELECT :org, 'task', :entity_pub_id, :tag_id WHERE NOT EXISTS (SELECT 1 FROM entity_tags WHERE organization_id=:check_org AND entity_type='task' AND entity_public_id=:check_entity AND tag_id=:check_tag)")
+                    ->execute(['org' => (int)$job['organization_id'], 'entity_pub_id' => $taskPublicId, 'tag_id' => $tagId, 'check_org' => (int)$job['organization_id'], 'check_entity' => $taskPublicId, 'check_tag' => $tagId]);
             }
         } catch (\Throwable $e) {
             error_log('[JiraImportService::ensureTag] Tag "' . $labelName . '" for task ' . $taskPublicId . ': ' . $e->getMessage());

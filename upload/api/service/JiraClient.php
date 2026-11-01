@@ -398,22 +398,35 @@ final class JiraClient
 
     public function downloadAttachment(string $siteUrl, string $email, string $token, string $contentUrl, string $targetPath): array
     {
-        // Validate URL
-        $allowedHost = parse_url($siteUrl, PHP_URL_HOST);
-        $actualHost = parse_url($contentUrl, PHP_URL_HOST);
-        if ($actualHost === false || $actualHost === null || $actualHost === '' || $actualHost !== $allowedHost) {
+        // Jira's attachment URL is supplied by the remote API. Keep credentials on the
+        // configured HTTPS origin and reject redirects, alternate ports and URL userinfo.
+        $base = parse_url($siteUrl);
+        $remote = parse_url($contentUrl);
+        if (!is_array($base) || !is_array($remote)
+            || strtolower((string)($base['scheme'] ?? '')) !== 'https'
+            || strtolower((string)($remote['scheme'] ?? '')) !== 'https'
+            || strtolower((string)($base['host'] ?? '')) !== strtolower((string)($remote['host'] ?? ''))
+            || (int)($base['port'] ?? 443) !== (int)($remote['port'] ?? 443)
+            || isset($remote['user']) || isset($remote['pass'])) {
             return ['success' => false, 'error' => 'SSRF_BLOCKED: Download host mismatch'];
         }
 
-        $fp = fopen($targetPath, 'w+b');
+        $maxBytes = 20 * 1024 * 1024;
+        $fp = fopen($targetPath, 'c+b');
         if ($fp === false) {
             return ['success' => false, 'error' => 'Failed to open temp file'];
         }
+        if (!ftruncate($fp, 0)) {
+            fclose($fp);
+            @unlink($targetPath);
+            return ['success' => false, 'error' => 'Failed to initialize temp file'];
+        }
+        @chmod($targetPath, 0600);
+        $written = 0;
 
         $ch = curl_init();
         curl_setopt_array($ch, [
             CURLOPT_URL => $contentUrl,
-            CURLOPT_FILE => $fp,
             CURLOPT_TIMEOUT => $this->timeout * 2,
             CURLOPT_CONNECTTIMEOUT => 10,
             CURLOPT_HTTPHEADER => [
@@ -422,24 +435,38 @@ final class JiraClient
             ],
             CURLOPT_FOLLOWLOCATION => false,
             CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
+            CURLOPT_WRITEFUNCTION => static function ($handle, string $chunk) use ($fp, &$written, $maxBytes): int {
+                $length = strlen($chunk);
+                if ($length > $maxBytes - $written) {
+                    return 0;
+                }
+                $saved = fwrite($fp, $chunk);
+                if ($saved === false) {
+                    return 0;
+                }
+                $written += $saved;
+                return $saved;
+            },
         ]);
 
-        curl_exec($ch);
+        $ok = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $error = curl_error($ch);
         $contentType = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
-        $size = curl_getinfo($ch, CURLINFO_SIZE_DOWNLOAD);
         curl_close($ch);
         fclose($fp);
 
-        if ($httpCode < 200 || $httpCode >= 300) {
+        if ($ok === false || $httpCode < 200 || $httpCode >= 300 || $written < 1) {
             @unlink($targetPath);
-            return ['success' => false, 'error' => "Download failed: HTTP $httpCode"];
+            $reason = $written >= $maxBytes ? 'Attachment exceeds size limit' : "Download failed: HTTP $httpCode";
+            return ['success' => false, 'error' => $reason . ($error !== '' ? ' (' . $error . ')' : '')];
         }
 
         return [
             'success' => true,
-            'size' => (int)$size,
+            'size' => $written,
             'mime_type' => $contentType ?: 'application/octet-stream',
             'path' => $targetPath,
         ];

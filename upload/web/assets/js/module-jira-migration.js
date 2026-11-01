@@ -5,6 +5,7 @@
     let selectedConnection = null;
     let selectedProjects = [];
     let currentJobId = null;
+    let currentJobStatus = null;
     let pollTimer = null;
 
     const steps = ['connections', 'source', 'settings', 'mappings', 'preview', 'run', 'report'];
@@ -36,7 +37,7 @@
         try {
             const resp = await window.CRM.api.request(BASE_API + '/connections');
             const connections = resp.data?.connections || [];
-            
+
             if (connections.length === 0) {
                 list.innerHTML = '<div class="text-muted py-3">' + window.CRM.i18n.t('jira_migration.no_connections', 'Нет подключений. Создайте новое к Jira Cloud.') + '</div>';
                 document.getElementById('toSourceBtn').style.display = 'none';
@@ -492,6 +493,7 @@
             // Store job ID for import
             if (resp.data?.job?.public_id) {
                 currentJobId = resp.data.job.public_id;
+                currentJobStatus = resp.data.job.status || 'draft';
             }
         } catch (err) {
             content.innerHTML = '<div class="text-danger py-3">' + window.CRM.i18n.t('jira_migration.load_error', 'Ошибка загрузки') + ': ' + err.message + '</div>';
@@ -526,8 +528,13 @@
             });
 
             currentJobId = resp.data?.job?.public_id;
+            currentJobStatus = resp.data?.job?.status || 'draft';
             if (currentJobId) {
-                await window.CRM.api.request(BASE_API + '/jobs/' + currentJobId + '/run', { method: 'POST' });
+                await window.CRM.api.request(BASE_API + '/jobs/' + currentJobId + '/run', {
+                    method: 'POST',
+                    body: JSON.stringify({ expected_status: currentJobStatus })
+                });
+                currentJobStatus = 'queued';
                 startPolling();
             }
         } catch (err) {
@@ -557,6 +564,7 @@
             const resp = await window.CRM.api.request(BASE_API + '/jobs/' + currentJobId);
             const job = resp.data?.job;
             if (!job) return;
+            currentJobStatus = job.status || currentJobStatus;
 
             // Update progress
             const percent = job.progress_percent || 0;
@@ -574,7 +582,7 @@
             }
 
             // Update logs
-            const logResp = await window.CRM.api.request(BASE_API + '/jobs/' + currentJobId + '/logs?limit=10');
+            const logResp = await window.CRM.api.request(BASE_API + '/jobs/' + currentJobId + '/logs', { query: { limit: 10 } });
             const logs = logResp.data?.logs || [];
             const logEl = document.getElementById('jobLog');
             logs.forEach(log => {
@@ -616,7 +624,11 @@
     document.getElementById('pauseJobBtn').addEventListener('click', async function() {
         if (!currentJobId) return;
         try {
-            await window.CRM.api.request(BASE_API + '/jobs/' + currentJobId + '/pause', { method: 'POST' });
+            await window.CRM.api.request(BASE_API + '/jobs/' + currentJobId + '/pause', {
+                method: 'POST',
+                body: JSON.stringify({ expected_status: currentJobStatus })
+            });
+            currentJobStatus = 'paused';
         } catch (err) {
             console.error('Pause failed:', err);
         }
@@ -625,7 +637,11 @@
     document.getElementById('resumeJobBtn').addEventListener('click', async function() {
         if (!currentJobId) return;
         try {
-            await window.CRM.api.request(BASE_API + '/jobs/' + currentJobId + '/run', { method: 'POST' });
+            await window.CRM.api.request(BASE_API + '/jobs/' + currentJobId + '/run', {
+                method: 'POST',
+                body: JSON.stringify({ expected_status: currentJobStatus })
+            });
+            currentJobStatus = 'queued';
             startPolling();
         } catch (err) {
             console.error('Resume failed:', err);
@@ -636,7 +652,11 @@
         if (!currentJobId) return;
         if (!confirm(window.CRM.i18n.t('jira_migration.confirm_cancel', 'Отменить миграцию?'))) return;
         try {
-            await window.CRM.api.request(BASE_API + '/jobs/' + currentJobId + '/cancel', { method: 'POST' });
+            await window.CRM.api.request(BASE_API + '/jobs/' + currentJobId + '/cancel', {
+                method: 'POST',
+                body: JSON.stringify({ expected_status: currentJobStatus })
+            });
+            currentJobStatus = currentJobStatus === 'running' ? 'cancelling' : 'cancelled';
         } catch (err) {
             console.error('Cancel failed:', err);
         }
@@ -705,7 +725,11 @@
     document.getElementById('retryFailedBtn').addEventListener('click', async function() {
         if (!currentJobId) return;
         try {
-            await window.CRM.api.request(BASE_API + '/jobs/' + currentJobId + '/retry-failed', { method: 'POST' });
+            await window.CRM.api.request(BASE_API + '/jobs/' + currentJobId + '/retry-failed', {
+                method: 'POST',
+                body: JSON.stringify({ expected_status: currentJobStatus })
+            });
+            currentJobStatus = 'queued';
             showStep('run');
             startPolling();
         } catch (err) {
@@ -715,6 +739,7 @@
 
     document.getElementById('newMigrationBtn').addEventListener('click', function() {
         currentJobId = null;
+        currentJobStatus = null;
         selectedProjects = [];
         showStep('connections');
         loadConnections();

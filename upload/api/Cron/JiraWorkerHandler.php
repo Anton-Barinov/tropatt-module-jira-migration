@@ -26,26 +26,37 @@ final class JiraWorkerHandler
         $pdo = $container->get('db.pdo');
         $repo = new JiraMigrationRepository($pdo);
 
-        // Find next queued job
-        $stmt = $pdo->prepare("SELECT public_id FROM module_jira_jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1");
-        $stmt->execute();
-        $jobPublicId = (string)$stmt->fetchColumn();
-
-        if ($jobPublicId === '') {
-            return;
-        }
-
-        $job = $repo->getJob($jobPublicId);
-        if (!$job) {
-            return;
-        }
-
-        $mode = (string)$job['mode'];
-
-        if ($mode === 'dry_run') {
-            self::runDryRun($job, $repo, $pdo);
-        } elseif (in_array($mode, ['import', 'sync'], true)) {
-            self::runImport($job, $repo, $pdo);
+        $job = $repo->claimNextJob();
+        if ($job === null) { return; }
+        $jobPublicId = (string)$job['public_id'];
+        $leaseToken = (string)($job['lease_token'] ?? '');
+        try {
+            // Membership is revalidated after the atomic claim and before work starts.
+            if ($leaseToken === '' || !$repo->actor((int)$job['created_by_user_id'], (int)$job['organization_id'])) {
+                $repo->updateJobStatus($jobPublicId, 'failed');
+                return;
+            }
+            $mode = (string)$job['mode'];
+            if ($mode === 'dry_run') {
+                self::runDryRun($job, $repo, $pdo);
+            } elseif (in_array($mode, ['import', 'sync'], true)) {
+                self::runImport($job, $repo, $pdo);
+            } else {
+                $repo->updateJobStatus($jobPublicId, 'failed');
+            }
+        } catch (\Throwable $e) {
+            error_log('[JiraWorkerHandler] Job processing failed: ' . $e->getMessage());
+            try {
+                $latest = $repo->getJob($jobPublicId);
+                if (($latest['status'] ?? '') === 'cancelling') {
+                    $repo->updateJobStatus($jobPublicId, 'cancelled');
+                } elseif (($latest['status'] ?? '') === 'running') {
+                    $repo->updateJobStatus($jobPublicId, 'failed');
+                }
+                // A paused job remains paused; a successor lease is never changed here.
+            } catch (\Throwable $ignored) {}
+        } finally {
+            $repo->releaseJobLease($jobPublicId);
         }
     }
 
@@ -69,8 +80,8 @@ final class JiraWorkerHandler
         $crawler = new JiraCrawler($client, $repo);
         $result = $crawler->crawlProjects($job, (string)$connection['site_url'], (string)$connection['email'], $token);
 
-        $repo->updateJobStatus((string)$job['public_id'], 'completed');
         $repo->updateJobProgress((string)$job['public_id'], 'dry_run_complete', 100, $result);
+        $repo->updateJobStatus((string)$job['public_id'], 'completed');
     }
 
     private static function runImport(array $job, JiraMigrationRepository $repo, PDO $pdo): void

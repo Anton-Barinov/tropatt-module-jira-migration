@@ -1,6 +1,6 @@
 {
     "name": "crm.jira-migration",
-    "version": "1.0.0",
+    "version": "1.0.2",
     "vendor": "crm",
     "author": "Anton Barinov",
     "author_url": "https://github.com/Anton-Barinov",
@@ -10,7 +10,11 @@
     "license": "MIT",
     "category": "migration",
     "dependencies": [],
-    "require_permissions": ["project.manage", "task.manage", "task.manage_settings"],
+    "require_permissions": [
+        "project.manage",
+        "task.manage",
+        "task.manage_settings"
+    ],
     "api_routes": "api/config/routes.php",
     "web_routes": "web/config/routes.php",
     "migrations": "api/migration/",
@@ -18,14 +22,18 @@
         "js_routes": {
             "module-jira-migration": "web/assets/js/module-jira-migration.js"
         },
-        "css": ["web/assets/css/module-jira-migration.css"]
+        "css": [
+            "web/assets/css/module-jira-migration.css"
+        ]
     },
-    "hooks": {},
+    "hooks": [],
     "menu_items": [],
     "service_provider": "Module\\Crm\\JiraMigration\\JiraMigrationServiceProvider",
     "config_defaults": {
         "max_attachment_size_mb": 20,
-        "allowed_jira_hosts": ["*.atlassian.net"],
+        "allowed_jira_hosts": [
+            "*.atlassian.net"
+        ],
         "custom_domain_allowlist": [],
         "default_batch_size": 100,
         "request_timeout_seconds": 60,
@@ -35,5 +43,6 @@
         "import_issue_limit": 0,
         "worklog_batch_size": 50,
         "attachment_download_timeout": 120
-    }
+    },
+    "signature": "07aed10de728c40a13559b19b06c7c8840dae79a99ac302452f1e502fc70c745"
 }
